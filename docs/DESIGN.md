@@ -355,7 +355,7 @@ spec:
     seccompProfile: { type: RuntimeDefault }
   containers:
     - name: agent
-      image: ghcr.io/muzaffarnurillaew/jprq-bek-agent:v0.1.0   # §13
+      image: ghcr.io/muzaffarnurillaew/jprq-agent:v0.1.0   # §13
       env:
         - name: JPRQ_PROTOCOL
           value: http
@@ -884,8 +884,8 @@ Registry:
 
 | Image | Contents | Exposure |
 |---|---|---|
-| `ghcr.io/muzaffarnurillaew/jprq-bek-manager` | controller only | cluster-internal, holds API-server credentials |
-| `ghcr.io/muzaffarnurillaew/jprq-bek-agent` | agent only | proxies arbitrary internet traffic |
+| `ghcr.io/muzaffarnurillaew/jprq-manager` | controller only | cluster-internal, holds API-server credentials |
+| `ghcr.io/muzaffarnurillaew/jprq-agent` | agent only | proxies arbitrary internet traffic |
 
 Separate rather than one image with subcommand dispatch, because the agent is the
 system's only internet-exposed component (§12.1). A combined image would ship the
@@ -901,18 +901,19 @@ construction rather than by convention:
   number duplicated in two places. The two images are always released under the
   same tag.
 - The manager does not guess the agent tag. It takes `--agent-image`, currently
-  defaulting to the literal `ghcr.io/muzaffarnurillaew/jprq-bek-agent:v0.1.0`
+  defaulting to the literal `ghcr.io/muzaffarnurillaew/jprq-agent:v0.1.0`
   in `cmd/main.go` (baking in the exact digest via `-ldflags` at build time is
   the intended end state, not yet wired up). So overriding it for a canary,
   or for local testing, is an explicit, visible act rather than a guess.
 
-  **Known gap:** unlike `IMG`, which the Makefile's `install`/`deploy` targets
-  push into the manifest via `kustomize edit set image controller=${IMG}`,
-  there is no equivalent kustomize wiring for `--agent-image` — it's a bare
-  container arg, and kustomize's image transformer only rewrites `image:`
-  fields, not args. `config/manager/manager.yaml` currently hardcodes
-  `--agent-image=agent:latest` for local kind use; a real deployment needs a
-  JSON6902 patch (or a generated arg) to point it at a real registry image.
+  For releases, `--agent-image` is not driven by kustomize's image transformer
+  — that only rewrites `image:` fields, not bare container args — so
+  `make build-installer` instead `sed`s the `--agent-image=agent:latest`
+  placeholder in the rendered manifest to `${AGENT_IMG}`, the same way
+  `IMG` is wired via `kustomize edit set image controller=${IMG}`. The
+  `controller-image.yml` release job passes both `IMG` and `AGENT_IMG` set to
+  the same release tag, so `install.yaml` always references two real,
+  same-tagged images.
 
 ---
 

@@ -93,7 +93,7 @@ func main() {
 	// The agent image is a manager-level setting, never a field on the CR: a
 	// user-settable image would be a privilege-escalation path, since v1 has no
 	// tenancy boundary on what a JprqTunnel may expose (DESIGN.md §12.2).
-	flag.StringVar(&agentImage, "agent-image", "ghcr.io/muzaffarnurillaew/jprq-bek-agent:v0.1.0",
+	flag.StringVar(&agentImage, "agent-image", "ghcr.io/muzaffarnurillaew/jprq-agent:v0.1.0",
 		"Image used for agent pods.")
 	flag.StringVar(&operatorNamespace, "operator-namespace", "jprq-system",
 		"Namespace holding agent pods and jprq token Secrets.")

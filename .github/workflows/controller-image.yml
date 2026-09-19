@@ -1,0 +1,98 @@
+name: Controller Image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch: {}
+
+env:
+  MANAGER_IMAGE: ghcr.io/muzaffarnurillaew/jprq-manager
+  AGENT_IMAGE: ghcr.io/muzaffarnurillaew/jprq-agent
+
+permissions: {}
+
+jobs:
+  build-and-push:
+    name: Build and push manager image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check for relevant changes
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            controller:
+              - 'cmd/**'
+              - 'internal/controller/**'
+              - 'internal/jprqconfig/**'
+              - 'api/**'
+              - 'Dockerfile'
+              - 'config/crd/**'
+              - 'config/rbac/**'
+              - 'config/manager/**'
+              - 'config/default/**'
+              - 'config/network-policy/**'
+
+      - name: Compute image tag
+        id: vars
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.filter.outputs.controller == 'true' || github.ref_type == 'tag'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build manager image
+        if: steps.filter.outputs.controller == 'true' || github.ref_type == 'tag'
+        run: make docker-build IMG=${{ env.MANAGER_IMAGE }}:${{ steps.vars.outputs.tag }}
+
+      - name: Push manager image
+        if: steps.filter.outputs.controller == 'true' || github.ref_type == 'tag'
+        run: make docker-push IMG=${{ env.MANAGER_IMAGE }}:${{ steps.vars.outputs.tag }}
+
+  release:
+    name: Publish install.yaml release
+    needs: build-and-push
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build install.yaml
+        run: |
+          make build-installer \
+            IMG=${{ env.MANAGER_IMAGE }}:${{ github.ref_name }} \
+            AGENT_IMG=${{ env.AGENT_IMAGE }}:${{ github.ref_name }}
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/install.yaml \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
