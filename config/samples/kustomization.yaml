@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- tunnel_v1alpha1_jprqtunnel.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

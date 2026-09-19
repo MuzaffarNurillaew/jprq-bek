@@ -8,4 +8,13 @@ layout:
 - go.kubebuilder.io/v4
 projectName: jprq-bek
 repo: github.com/muzaffarnurillaew/jprq-bek
+resources:
+- api:
+    crdVersion: v1
+  controller: true
+  domain: jprq.io
+  group: tunnel
+  kind: JprqTunnel
+  path: github.com/muzaffarnurillaew/jprq-bek/api/v1alpha1
+  version: v1alpha1
 version: "3"
