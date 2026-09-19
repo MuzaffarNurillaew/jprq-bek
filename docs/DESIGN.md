@@ -346,7 +346,7 @@ spec:
     seccompProfile: { type: RuntimeDefault }
   containers:
     - name: agent
-      image: ghcr.io/muzaffar/jprq-bek-agent:v0.1.0   # §13
+      image: ghcr.io/muzaffarnurillaew/jprq-bek-agent:v0.1.0   # §13
       env:
         - name: JPRQ_PROTOCOL
           value: http
@@ -799,8 +799,8 @@ Registry:
 
 | Image | Contents | Exposure |
 |---|---|---|
-| `ghcr.io/muzaffar/jprq-bek-manager` | controller only | cluster-internal, holds API-server credentials |
-| `ghcr.io/muzaffar/jprq-bek-agent` | agent only | proxies arbitrary internet traffic |
+| `ghcr.io/muzaffarnurillaew/jprq-bek-manager` | controller only | cluster-internal, holds API-server credentials |
+| `ghcr.io/muzaffarnurillaew/jprq-bek-agent` | agent only | proxies arbitrary internet traffic |
 
 Separate rather than one image with subcommand dispatch, because the agent is the
 system's only internet-exposed component (§12.1). A combined image would ship the
@@ -848,10 +848,10 @@ construction rather than by convention:
 | # | Question | Notes |
 |---|---|---|
 | OPEN-1 | `addSuffix`: sticky suffix or re-rolled per attempt? | §9.3, deferred along with the feature itself |
-| OPEN-2 | Is `muzaffar` the correct GHCR owner namespace? | §13 assumes `ghcr.io/muzaffar/...`; swap if your GitHub owner differs |
 
 Resolved during review: API group `tunnel.jprq.io`, operator namespace
-`jprq-system`, GHCR as the registry, `jprqTokenSecret` required with a
+`jprq-system`, GHCR as the registry under owner `muzaffarnurillaew`, Go module
+path `github.com/muzaffarnurillaew/jprq-bek`, `jprqTokenSecret` required with a
 single-account assumption, `serviceName` in `spec.backend`, no quota gating, and
 separate manager/agent images.
 
