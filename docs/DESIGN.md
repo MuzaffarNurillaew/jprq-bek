@@ -351,6 +351,7 @@ spec:
   securityContext:
     runAsNonRoot: true
     runAsUser: 65532
+    fsGroup: 65532                         # so the non-root container can read the token file below
     seccompProfile: { type: RuntimeDefault }
   containers:
     - name: agent
@@ -387,7 +388,7 @@ spec:
       secret:
         secretName: jprq-token
         items: [{ key: authToken, path: authToken }]
-        defaultMode: 0400
+        defaultMode: 0440
 ```
 
 Env vars rather than a ConfigMap, because the manager owns this pod spec
@@ -492,16 +493,23 @@ misread as a crash.
 
 ### 8.1 Delivery: projected Secret file
 
-The Secret is mounted at `/etc/jprq/authToken`, mode `0400`, and the agent reads
-the raw token from that path (`JPRQ_TOKEN_FILE`). Because we own the agent (§4),
-upstream's `{"auth_token":"..."}` file format (F7) is not a requirement — the
-file holds the raw token and there is nothing to template.
+The Secret is mounted at `/etc/jprq/authToken`, mode `0440` with `fsGroup: 65532`,
+and the agent reads the raw token from that path (`JPRQ_TOKEN_FILE`). Because we
+own the agent (§4), upstream's `{"auth_token":"..."}` file format (F7) is not a
+requirement — the file holds the raw token and there is nothing to template.
+
+Kubernetes Secret volume files are root-owned regardless of the pod's
+`runAsUser`; only `fsGroup` gets the container's non-root user into the file's
+group, and only a group-readable mode (`0440`, not `0400`) actually grants that
+group read access. Discovered by running against a real kind cluster (`0400`
+alone passed envtest, which never materializes real files, then failed with
+`permission denied` under a real kubelet) — see §17.7.
 
 **Why a file rather than `secretKeyRef` env** — you asked, so the honest version:
 
 - An env var is readable from `/proc/<pid>/environ` by anything that can exec in
-  the container, and is inherited by every child process. A `0400` file read once
-  at startup has a narrower reach.
+  the container, and is inherited by every child process. A group-readable file
+  read once at startup has a narrower reach.
 - Rotation takes effect on **container restart** instead of requiring pod
   replacement. Kubelet updates Secret volumes in place, and per F2 container
   restarts are routine — so a rotated token lands on the next restart. An env var
@@ -892,10 +900,19 @@ construction rather than by convention:
   exit-code contract of §7.2 is a shared Go constant in `internal/jprq`, not a
   number duplicated in two places. The two images are always released under the
   same tag.
-- The manager does not guess the agent tag. It takes `--agent-image`, defaulting
-  to the exact digest baked in at build time via `-ldflags`. So a manager
-  never silently pairs with an agent it was not built against, and overriding it
-  for a canary is an explicit, visible act.
+- The manager does not guess the agent tag. It takes `--agent-image`, currently
+  defaulting to the literal `ghcr.io/muzaffarnurillaew/jprq-bek-agent:v0.1.0`
+  in `cmd/main.go` (baking in the exact digest via `-ldflags` at build time is
+  the intended end state, not yet wired up). So overriding it for a canary,
+  or for local testing, is an explicit, visible act rather than a guess.
+
+  **Known gap:** unlike `IMG`, which the Makefile's `install`/`deploy` targets
+  push into the manifest via `kustomize edit set image controller=${IMG}`,
+  there is no equivalent kustomize wiring for `--agent-image` — it's a bare
+  container arg, and kustomize's image transformer only rewrites `image:`
+  fields, not args. `config/manager/manager.yaml` currently hardcodes
+  `--agent-image=agent:latest` for local kind use; a real deployment needs a
+  JSON6902 patch (or a generated arg) to point it at a real registry image.
 
 ---
 
@@ -906,7 +923,7 @@ construction rather than by convention:
 | D-01 | Own agent in `cmd/agent`, upstream protocol copied to `internal/jprq` | socat sidecar; fork upstream | Solves F1 *and* F5 together; a sidecar leaves every failure as exit 1 |
 | D-02 | Cluster-scoped CRD, pods in `jprq-system` | namespaced | Cluster-wide inventory; token lives in exactly one place. Cost in §12.2 |
 | D-03 | Bare Pod | Deployment `replicas=1, Recreate` | F4 makes `replicas` dead weight and `RollingUpdate` unusable; exit codes are one `Get` away |
-| D-04 | Projected Secret file at `/etc/jprq/authToken`, mode 0400 | `secretKeyRef` env; initContainer writing upstream's JSON | Owning the agent removes F7's file-format requirement; file avoids `/proc/environ` and rotates on restart — §8.1 |
+| D-04 | Projected Secret file at `/etc/jprq/authToken`, mode 0440 + `fsGroup: 65532` | `secretKeyRef` env; initContainer writing upstream's JSON; mode 0400 (blocked the non-root container from reading its own token) | Owning the agent removes F7's file-format requirement; file avoids `/proc/environ` and rotates on restart — §8.1 |
 | D-05 | Exit codes 10–22 + `/healthz` + JSON logs | text-match stderr | F5/F6: decouples the controller from server message strings |
 | D-06 | No in-agent reconnect | retry with backoff | Keeps `restartCount`/readiness truthful; 5-min backoff cap accepted (§6.2) |
 | D-07 | No quota gating — exit 12 is terminal, recovery is manual | FIFO gating per token; validating webhook | F12 makes any gate unsound, since tunnels run outside the cluster are uncountable; the gate could not remove the exit-12 path anyway — §10.2 |
@@ -1076,6 +1093,24 @@ any other checkout.
   (`recorder.EventRecorder`, not the deprecated `record.EventRecorder`) for
   terminal failures, collisions, and Pod create/recreate — see §14 decision
   log.
-- Still open: a second Dockerfile, or one parameterized by `ARG CMD`, for the
-  agent image — deferred to the phase that first needs a runnable agent image
-  (kind e2e).
+- **Resolved:** the agent got its own `Dockerfile.agent` (mirrors the manager's
+  `Dockerfile`, builds `./cli` instead of `cmd/main.go`), plus `make
+  docker-build-agent`/`kind-load` targets and `--agent-image` wired into
+  `config/manager/manager.yaml`, once a real kind run needed a runnable agent
+  image. `.dockerignore` needed `!cli/debugger/static/**` re-included too —
+  `cli/debugger/server.go`'s `go:embed` directives fail the build otherwise
+  (only `*.go` files were re-included).
+- **Found only by running against real kind, not envtest** (envtest has no
+  kubelet and never materializes real container filesystems):
+  - Both images need `imagePullPolicy: IfNotPresent` — the `:latest` tag
+    otherwise defaults to `Always`, and kubelet tries (and fails) to pull from
+    Docker Hub instead of using the image `kind load` already placed on the
+    node.
+  - The token Secret volume's mode 0400 left it unreadable by the non-root
+    agent container — see D-04 and §8.1's rewrite.
+- **End-to-end verification passed** against a real local kind cluster: CRD
+  installed, manager deployed, a `JprqTunnel` created against a real jprq.io
+  account reached `status.phase: Active` with a populated `status.url`, and
+  the public URL reached a backend Pod running in the cluster. This closes the
+  plan's last open verification item — the only remaining unautomated step is
+  wiring the same flow into `test/e2e/`.

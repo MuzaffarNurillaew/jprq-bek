@@ -400,8 +400,8 @@ func TestDesiredPodShape(t *testing.T) {
 		t.Errorf("pod label %s = %q, want web", TunnelLabel, pod.Labels[TunnelLabel])
 	}
 
-	if mode := pod.Spec.Volumes[0].Secret.DefaultMode; mode == nil || *mode != 0o400 {
-		t.Errorf("token volume mode = %v, want 0400", mode)
+	if mode := pod.Spec.Volumes[0].Secret.DefaultMode; mode == nil || *mode != 0o440 {
+		t.Errorf("token volume mode = %v, want 0440", mode)
 	}
 	if got := pod.Spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem; got == nil || !*got {
 		t.Error("readOnlyRootFilesystem must be true")

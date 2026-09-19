@@ -12,3 +12,7 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include the debugger's embedded static assets (cli/debugger/server.go
+# go:embed directives need these present at build time).
+!cli/debugger/static/**

@@ -158,13 +158,18 @@ func desiredPod(
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: new(true),
 				RunAsUser:    new(int64(65532)),
+				// The token Secret's projected file is root-owned; FSGroup makes
+				// kubelet chgrp it to this GID so the non-root container can
+				// read it (paired with the volume's group-readable DefaultMode).
+				FSGroup: new(int64(65532)),
 				SeccompProfile: &corev1.SeccompProfile{
 					Type: corev1.SeccompProfileTypeRuntimeDefault,
 				},
 			},
 			Containers: []corev1.Container{{
-				Name:  agentContainerName,
-				Image: cfg.Image,
+				Name:            agentContainerName,
+				Image:           cfg.Image,
+				ImagePullPolicy: corev1.PullIfNotPresent,
 				Env: []corev1.EnvVar{
 					{Name: "JPRQ_PROTOCOL", Value: protocolHTTP},
 					{Name: "JPRQ_BACKEND_HOST", Value: cfg.BackendHost},
@@ -215,7 +220,7 @@ func desiredPod(
 							Key:  cfg.SecretKey,
 							Path: cfg.SecretKey,
 						}},
-						DefaultMode: new(int32(0o400)),
+						DefaultMode: new(int32(0o440)),
 					},
 				},
 			}},

@@ -1,5 +1,9 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
+# Image URL for the agent (jprq CLI) image, built from Dockerfile.agent.
+AGENT_IMG ?= agent:latest
+# Name of the local kind cluster to load images into.
+KIND_CLUSTER ?= kind
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -136,6 +140,18 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
+
+.PHONY: docker-build-agent
+docker-build-agent: ## Build docker image with the agent (jprq CLI).
+	$(CONTAINER_TOOL) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t ${AGENT_IMG} -f Dockerfile.agent .
+
+.PHONY: docker-push-agent
+docker-push-agent: ## Push docker image with the agent.
+	$(CONTAINER_TOOL) push ${AGENT_IMG}
+
+.PHONY: kind-load
+kind-load: ## Load the manager and agent images into the local kind cluster (no registry needed).
+	$(KIND) load docker-image ${IMG} ${AGENT_IMG} --name $(KIND_CLUSTER)
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
