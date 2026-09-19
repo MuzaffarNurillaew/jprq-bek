@@ -358,16 +358,14 @@ spec:
           value: muzaffar-web
         - name: JPRQ_TOKEN_FILE
           value: /etc/jprq/authToken
-        - name: JPRQ_LOG_FORMAT
-          value: json
         - name: JPRQ_HEALTH_ADDR
-          value: 127.0.0.1:9000
+          value: ":9000"
       volumeMounts:
         - name: token
           mountPath: /etc/jprq
           readOnly: true
       readinessProbe:                    # §7.3
-        httpGet: { path: /healthz, port: 9000, host: 127.0.0.1 }
+        httpGet: { path: /healthz, port: 9000 }
         periodSeconds: 10
       securityContext:
         allowPrivilegeEscalation: false
@@ -409,7 +407,7 @@ This is the controller↔agent interface. It is the reason we own the binary.
 | `JPRQ_CNAME` | Reserved, unset in v1 (F10) |
 | `JPRQ_TOKEN_FILE` | Path to a file containing the raw token |
 | `JPRQ_HEALTH_ADDR` | Health listener address |
-| `JPRQ_LOG_FORMAT` | `json` in-cluster, `text` on a laptop |
+| ~~`JPRQ_LOG_FORMAT`~~ | dropped — logs are always JSON, see §17.3 |
 
 Precedence: flags > env > upstream config file (§4.1).
 
@@ -444,9 +442,20 @@ log volume. Only human action resolves them.
 
 ### 7.3 Health endpoint
 
-`GET /healthz` on `127.0.0.1` returns 200 once `TunnelOpened` is received and the
-event loop is running; 503 before that. Loopback-bound because only the kubelet
-needs it, so it is never exposed through the tunnel.
+`GET /healthz` returns 200 once `TunnelOpened` is received and the event loop is
+running; 503 before that. Backed by an `atomic.Bool` set only after the server's
+`TunnelOpened` comes back error-free, so readiness means "tunnel established",
+not "process alive".
+
+Bound to `:9000` — **all interfaces, not loopback.** An earlier draft specified
+`127.0.0.1` on the reasoning that only the kubelet needs it. That was wrong: in
+an `httpGet` probe the kubelet is the client and runs on the *node*, outside the
+pod's network namespace, so a loopback-bound listener can never answer it and the
+pod would never become Ready. The probe correspondingly omits `host`, letting the
+kubelet default to the pod IP. This is not an exposure regression — the agent pod
+has no Service, so the port is reachable only by pod IP from inside the cluster,
+and the response carries no payload. `JPRQ_HEALTH_ADDR` can still be set to
+`127.0.0.1:9000` for local testing.
 
 This makes `status.Ready` derive from the kubelet's own `Pod.Ready`, rather than
 from the controller inferring liveness — which it cannot do reliably, since a
@@ -872,3 +881,111 @@ Phase 1 first because it is independently verifiable: the exit-code contract of
 §7.2 is the foundation everything in phases 3–4 keys off, and it is far cheaper
 to validate against a live jprq account from a terminal than through a
 reconciler.
+
+---
+
+## 17. Implementation deltas (phase 1 complete)
+
+Phase 1 is built and verified. Where the shipped code differs from the sections
+above, **the code is authoritative** and this section records why.
+
+### 17.1 Layout: `cli/`, not `cmd/agent/` + `internal/jprq/`
+
+§13 specified `cmd/agent/` with vendored protocol code in `internal/jprq/`.
+Shipped layout:
+
+```
+cli/
+  main.go  jprqc.go  config.go     copied from upstream, minimally patched
+  debugger/                        copied verbatim (see 17.4)
+  jprq/
+    events.go  events_test.go      verbatim upstream wire protocol
+    bind.go                        Bind only, 22 lines
+    exitcodes.go                   Exit* + ErrPrefix* constants, §7.2
+```
+
+Three reasons: `cmd/main.go` is the manager's entrypoint and nothing
+manager-side had to move; mirroring upstream's own `cli/` layout keeps the copied
+files directly diffable against upstream, which matters because F11 gives the
+wire protocol no version negotiation; and `cli/jprq/` is deliberately **not**
+under `internal/` so the controller can import `Exit*`/`ErrPrefix*` — the shared
+constant block §13's version-skew argument depends on.
+
+`exitCodeForServerError()` currently lives in `cli/jprqc.go`. It should move to
+`cli/jprq/exitcodes.go`, next to the prefixes it matches on.
+
+### 17.2 Copy-then-patch, not rewrite
+
+The agent is upstream's CLI with minimal diffs, not a reimplementation. Measured
+changed lines vs upstream: `config.go` 41, `main.go` 85, `jprqc.go` 107. Upstream
+function and struct names, declaration order, and comment style are preserved.
+Provenance is upstream commit `3c10e25`, MIT (Copyright (c) 2020 Azimjon
+Pulatov) — note no `LICENSE` file exists in the current upstream checkout; it was
+located via `git log --diff-filter=A -- LICENSE` at commit `7077672`. Each copied
+file carries a provenance header.
+
+The `WriteError` bug in `events.go` (F6) is **preserved deliberately**.
+Classification matches the literal prefix before the format verb, so repairing it
+would change the wire text we key on.
+
+### 17.3 No `JPRQ_LOG_FORMAT`
+
+§7.1 listed a log-format switch. Removed: logging is always JSON, implemented as
+one line redirecting the stdlib `log` package through an slog JSON handler, which
+left every upstream `log.Printf`/`log.Fatalf` call site untouched. The
+human-facing `fmt.Printf` status block ("Status / Protocol / Forwarded") is not
+logging and stays as-is.
+
+### 17.4 Upstream subcommands and `--debug` retained
+
+§1 scoped v1 to HTTP, and an earlier plan deleted `tcp`, `serve`, `auth`, and
+`cli/debugger/`. Reversed, because upstream's help text advertises all of them and
+keeping help identical is what makes the binary a genuine drop-in per §4.1.
+HTTP-only is enforced by the *controller* only ever invoking `http`; it is not the
+CLI's job to police.
+
+**Cost, which qualifies §13's "minimal and distroless" claim:** copying
+`cli/debugger/` added `github.com/djherbis/buffer` and
+`github.com/djherbis/nio/v3` to `go.mod`, plus embedded static assets, all inside
+the internet-exposed agent image. Still open whether that trade is worth it; the
+alternative is dropping `debugger/` and deleting the two `--debug` lines from
+`printHelp()`.
+
+### 17.5 Configuration as shipped
+
+Precedence is flags/positional args > env > upstream config file.
+
+| Variable | Status |
+|---|---|
+| `JPRQ_PROTOCOL` | implemented (stands in for the command arg) |
+| `JPRQ_BACKEND_HOST` | implemented — replaces upstream's hardcoded `localhost` (F1); empty falls back to `localhost` for laptop parity |
+| `JPRQ_BACKEND_PORT` | implemented (stands in for the port arg) |
+| `JPRQ_SUBDOMAIN` | implemented (fallback for `-s`) |
+| `JPRQ_TOKEN_FILE` | implemented, with fallback to `~/.config/jprq/.jprq-config` per §4.1 |
+| `JPRQ_HEALTH_ADDR` | implemented, default `:9000` (§7.3) |
+| `JPRQ_CNAME` | **NOT implemented** — yet `exitcodes.go` documents `ExitCNAMEBusy = 11` as "unreachable in v1 (`JPRQ_CNAME` unset)", so the contract references a variable that does not exist |
+| `JPRQ_DEBUG` | **NOT implemented** — `--debug` has no env alternative |
+
+### 17.6 Build
+
+`make build-cli` → `go build -o bin/agent ./cli`; `make run-cli`; `build-cli` is
+wired into `all`. It depends on `fmt vet` only, not `manifests generate`, since
+the CLI has no CRD codegen dependency. `bin/`, `testbin/`, and `Dockerfile.cross`
+are gitignored — tool binaries are never committed, since versions are pinned in
+the Makefile and `bin/controller-gen` is an absolute symlink that would dangle in
+any other checkout.
+
+### 17.7 Still pending before phase 3
+
+- Operator namespace: the scaffold produced `jprq-bek-system`; §12 and §13 say
+  `jprq-system`. Needs changing in `config/default/`, `config/rbac/`,
+  `config/manager/`.
+- Second Dockerfile, or one parameterized by `ARG CMD`, for the agent image.
+- **Undecided:** should `/healthz` also TCP-dial the backend? As shipped,
+  readiness means "event stream established", so a pod with a wrong
+  `JPRQ_BACKEND_HOST` reports Ready and `status.phase: Active` while every request
+  502s. Including a backend dial would make Pod-Ready mean "works end to end" and
+  align it with what §5.5's `Active` implies. This changes §5.5 semantics, so it
+  is deliberately left open.
+- Nothing is committed yet: `cli/`, `Makefile`, `go.mod`, `go.sum`, `.gitignore`,
+  and the whole scaffold are uncommitted working-tree changes.
