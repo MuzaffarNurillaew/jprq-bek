@@ -14,7 +14,26 @@ spec:
     singular: jprqtunnel
   scope: Cluster
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.subdomain
+      name: Subdomain
+      type: string
+    - jsonPath: .status.url
+      name: URL
+      type: string
+    - jsonPath: .status.backendAddress
+      name: Backend
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: JprqTunnel is the Schema for the jprqtunnels API
@@ -39,25 +58,138 @@ spec:
           spec:
             description: spec defines the desired state of JprqTunnel
             properties:
-              foo:
-                description: foo is an example field of JprqTunnel. Edit jprqtunnel_types.go
-                  to remove/update
+              backend:
+                description: backend is the in-cluster Service to expose.
+                properties:
+                  namespace:
+                    description: namespace of the backend Service.
+                    minLength: 1
+                    type: string
+                  port:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      port is a Service port name or number. Names are resolved to a number by
+                      the controller, so the agent only ever sees a number and therefore needs
+                      no API access of its own (DESIGN.md §9.2).
+                    x-kubernetes-int-or-string: true
+                  serviceName:
+                    description: serviceName of the backend Service.
+                    minLength: 1
+                    type: string
+                required:
+                - namespace
+                - port
+                - serviceName
+                type: object
+              cname:
+                description: |-
+                  cname is reserved for custom hostnames. Schema only in v1alpha1, and
+                  rejected at admission (DESIGN.md §11).
+                properties:
+                  cloudflareTokenSecret:
+                    description: cloudflareTokenSecret names the Secret holding a
+                      Cloudflare API token.
+                    properties:
+                      key:
+                        default: authToken
+                        description: key within the Secret holding the raw token.
+                        type: string
+                      name:
+                        description: name of the Secret, which must live in the operator
+                          namespace.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  hostname:
+                    description: hostname to serve, e.g. tunnel.example.com.
+                    type: string
+                required:
+                - cloudflareTokenSecret
+                - hostname
+                type: object
+              jprqTokenSecret:
+                description: jprqTokenSecret names the Secret holding the jprq auth
+                  token.
+                properties:
+                  key:
+                    default: authToken
+                    description: key within the Secret holding the raw token.
+                    type: string
+                  name:
+                    description: name of the Secret, which must live in the operator
+                      namespace.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              subdomain:
+                description: |-
+                  subdomain is the public name to claim, reachable at
+                  https://<subdomain>.<jprq domain>.
+
+                  The bounds and pattern are the jprq server's own rules transcribed, so
+                  every subdomain this API accepts is one the server will accept, making
+                  "invalid subdomain" structurally impossible at runtime rather than a
+                  crash-loop to diagnose (DESIGN.md §5.2).
+                maxLength: 38
+                minLength: 3
+                pattern: ^[a-z0-9](?:[a-z0-9]|-[a-z0-9]){2,37}$
                 type: string
+              subdomainCollisionBehavior:
+                default: fail
+                description: |-
+                  subdomainCollisionBehavior decides what happens when the jprq server
+                  reports the subdomain is already taken. Collisions are only discoverable
+                  by trying, since jprq exposes no list-tunnels API (DESIGN.md §9.3).
+
+                  "fail" records a terminal failure and does not retry. "retry" leaves the
+                  agent to keep re-claiming until the holder releases the name.
+                  "addSuffix" is schema-visible but rejected in v1alpha1.
+                enum:
+                - fail
+                - retry
+                - addSuffix
+                type: string
+            required:
+            - backend
+            - jprqTokenSecret
+            - subdomain
             type: object
+            x-kubernetes-validations:
+            - message: subdomains 'www' and 'jprq' are reserved by the jprq server
+              rule: self.subdomain != 'www' && self.subdomain != 'jprq'
+            - message: subdomainCollisionBehavior 'addSuffix' is not implemented in
+                v1alpha1
+              rule: '!has(self.subdomainCollisionBehavior) || self.subdomainCollisionBehavior
+                != ''addSuffix'''
+            - message: spec.cname is not implemented in v1alpha1
+              rule: '!has(self.cname)'
           status:
             description: status defines the observed state of JprqTunnel
             properties:
+              assignedSubdomain:
+                description: |-
+                  assignedSubdomain is the subdomain actually claimed. Equal to
+                  spec.subdomain in v1alpha1; kept distinct so addSuffix can pin a
+                  generated name here later without a status migration (DESIGN.md §5.5).
+                type: string
+              backendAddress:
+                description: |-
+                  backendAddress is the resolved host:port the agent was given, with the
+                  Service port name already resolved to a number. Answers "what did the
+                  agent actually dial?" and powers the BACKEND printer column.
+                type: string
               conditions:
                 description: |-
                   conditions represent the current state of the JprqTunnel resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
 
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                  Condition types are Ready, BackendReady and TokenReady: three independent
+                  causes of not-working, each separately observable.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,6 +248,44 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastExitCode:
+                description: |-
+                  lastExitCode is the agent's most recent container exit code, which is how
+                  server verdicts are classified (DESIGN.md §7.2).
+                format: int32
+                type: integer
+              lastFailureMessage:
+                description: lastFailureMessage is the most recent human-readable
+                  failure.
+                type: string
+              observedGeneration:
+                description: |-
+                  observedGeneration is the spec generation this status reflects. Also the
+                  gate on sticky terminal failures.
+                format: int64
+                type: integer
+              phase:
+                description: |-
+                  phase is a derived summary for humans and printer columns: Pending,
+                  Active, Degraded or Failed. Conditions are the machine-readable truth.
+
+                  Failed is sticky: it clears only when metadata.generation changes, so
+                  re-applying unchanged YAML does not re-arm a failed tunnel. This is what
+                  stops a rejected token from crash-looping forever (DESIGN.md §5.5, §10.1).
+                type: string
+              podName:
+                description: podName is the agent Pod in the operator namespace.
+                type: string
+              restartCount:
+                description: |-
+                  restartCount mirrors kubelet's container restart count. Since the agent
+                  exits whenever the event stream drops, restartPolicy: Always is the
+                  reconnect mechanism and this is a truthful health signal (DESIGN.md §6.2).
+                format: int32
+                type: integer
+              url:
+                description: url is the public address of the tunnel.
+                type: string
             type: object
         required:
         - spec

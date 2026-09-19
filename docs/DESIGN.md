@@ -242,6 +242,7 @@ type JprqTunnelStatus struct {
     Phase              string  `json:"phase,omitempty"`   // Pending|Active|Degraded|Failed
     URL                string  `json:"url,omitempty"`     // https://<sub>.jprq.live
     AssignedSubdomain  string  `json:"assignedSubdomain,omitempty"`
+    BackendAddress     string  `json:"backendAddress,omitempty"` // web.default.svc:8080, the resolved address the agent was actually given
     PodName            string  `json:"podName,omitempty"`
     LastExitCode       *int32  `json:"lastExitCode,omitempty"`
     LastFailureMessage string  `json:"lastFailureMessage,omitempty"`
@@ -250,6 +251,13 @@ type JprqTunnelStatus struct {
     Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 ```
+
+**`BackendAddress`** (added in phase 2/3) holds the resolved `host:port` the
+agent was actually started with, after the controller turns a named
+`spec.backend.port` into a number. `BACKEND` needed as a printer column
+(below), but a printer column's JSONPath cannot concatenate `spec.backend`'s
+three fields into `ns/name:port`; the field also doubles as the answer to "what
+did the agent actually dial", which otherwise requires reading the Pod's env.
 
 `AssignedSubdomain` is distinct from `spec.Subdomain` from day one even though
 v1 always sets them equal. It is where `addSuffix` will write its generated name
@@ -267,8 +275,8 @@ spec edit — or by deleting and recreating the resource. Re-running
 because generation does not change. This is deliberate: it is what stops a
 rejected token from crash-looping forever. See §10 for the recovery workflow.
 
-**Printer columns:** `SUBDOMAIN`, `URL`, `BACKEND` (`ns/name:port`), `PHASE`,
-`READY`, `AGE`.
+**Printer columns:** `SUBDOMAIN`, `URL`, `BACKEND` (`.status.backendAddress`),
+`PHASE`, `READY` (`.status.conditions[?(@.type=="Ready")].status`), `AGE`.
 
 ---
 
@@ -544,10 +552,17 @@ within milliseconds. The periodic resync is a safety net for missed events and
 the driver of retry backoff — not the primary mechanism.
 
 Convergence uses an **annotation spec-hash** over everything that affects the
-pod: resolved backend host and port, subdomain, token Secret name and key,
-protocol, and agent image. If the live pod's hash differs, the pod is deleted
-and recreated — never patched, since a Pod's env and args are immutable and F4
-forbids overlap anyway.
+pod: resolved backend host and port, subdomain, token Secret name and key, a
+**SHA-256 digest of the token bytes**, protocol, and agent image. If the live
+pod's hash differs, the pod is deleted and recreated — never patched, since a
+Pod's env and args are immutable and F4 forbids overlap anyway.
+
+The token digest is a deliberate addition beyond "Secret name and key": without
+it, an in-place token rotation (same Secret, same key, new value) would never
+change the hash, so the pod would keep running with the token it read at
+startup and the rotation would be silently ignored. Only a digest of a
+high-entropy token ever reaches the annotation — the same pattern as Helm's
+`checksum/secret`.
 
 ### 9.2 Main loop
 
@@ -576,10 +591,16 @@ sequenceDiagram
 
     R->>K: Get Service backend.namespace, backend.serviceName
     opt Service missing or port unresolvable
-        R->>K: set BackendReady=False, Phase=Pending
-        Note over R: return, no Pod created
+        R->>K: set BackendReady=False, Phase=Pending (or Degraded if a Pod already exists)
+        Note over R: return, Pod is created only, never deleted, for this gate
     end
     Note over R: resolve named port to a number, the agent only ever sees a number
+
+    R->>K: List EndpointSlices for the Service
+    opt zero ready endpoints
+        R->>K: set BackendReady=False, Phase=Pending (or Degraded if a Pod already exists)
+        Note over R: return, existing Pod is left running — releasing the subdomain risks losing it, F12
+    end
 
     R->>K: Get Pod jprq-web
     alt Pod absent
@@ -592,14 +613,16 @@ sequenceDiagram
         K-->>R: ready flag and lastState terminated exitCode
     end
 
-    alt exitCode 13 or 15
+    alt container currently Running and Ready
+        Note over R: never classify from a stale LastTerminationState
+    else exitCode 13 or 15
         R->>K: TokenReady=False, Phase=Failed, delete Pod
     else exitCode 12
         R->>K: Phase=Failed, reason AccountTunnelLimitReached, delete Pod
     else exitCode 10
         R->>R: collision handling, see section 9.3
     else ready, no terminal exitCode
-        R->>K: Phase=Active, URL from tunnel_opened log line
+        R->>K: Phase=Active, URL composed from the cached jprq.io domain + assignedSubdomain
     else not ready, no terminal exitCode
         R->>K: Phase=Degraded, requeue with backoff
     end
@@ -620,7 +643,38 @@ permits `automountServiceAccountToken: false` (§6.3).
 
 > Note: the controller resolves the **Service port**, and traffic goes to the
 > ClusterIP, so `targetPort` remains the Service's business — kube-proxy handles
-> it. We do not resolve Endpoints.
+> it. We do not resolve Endpoints for traffic — but we do read EndpointSlices
+> for readiness, next.
+
+**`BackendReady` requires ≥1 ready EndpointSlice endpoint**, not just a Service
+that exists and a port that resolves. This closes the open question in §17.7
+about whether `/healthz` should also dial the backend — it doesn't need to,
+because the controller's own readiness check now catches a backend with no
+healthy pods without touching the agent.
+
+The check is deliberately **asymmetric**: a backend with no ready endpoints
+blocks *creating* a Pod, but never causes the controller to *delete* a running
+one. Deleting releases the subdomain claim, and F12 means that claim might not
+be won back. A backend that flaps to zero ready endpoints therefore surfaces as
+`BackendReady=False` + `Phase=Degraded` with the Pod left running, not as a
+lost tunnel.
+
+**The exit-code classification only runs when the agent container is not
+currently `Running` and `Ready`.** With `restartPolicy: Always`,
+`LastTerminationState.Terminated` survives a successful restart, so reading it
+unconditionally would judge a healthy, currently-working tunnel by a
+termination from several restarts ago and wrongly mark it `Failed`.
+
+**`status.url`** is composed by the manager, not read from the agent. §9.2
+originally assumed the URL came from parsing a `tunnel_opened` log line — that
+line does not exist; the agent prints an unstructured `Forwarded: ...` line to
+stdout via `fmt.Printf` (`cli/jprqc.go`), and the hostname is server-assigned.
+Instead, the manager lazily fetches `https://jprq.io/config.json` on first
+need (mirroring the agent's own startup fetch, `cli/config.go`), caches the
+domain for the process lifetime on success, and composes
+`https://<assignedSubdomain>.<domain>`. A failed fetch never blocks Pod
+creation — it only leaves `status.url` empty until the next successful
+resync, since the URL is cosmetic and the tunnel works without it.
 
 ### 9.3 Collision handling (exit 10)
 
@@ -645,9 +699,11 @@ sequenceDiagram
         R->>K: Phase=Failed, reason SubdomainBusy, delete Pod
         Note over R,K: no retry, re-armed only by a spec edit or recreate
     else behavior retry
-        R->>K: Phase=Degraded, reason SubdomainBusy, delete Pod
-        R->>R: requeue after capped exponential backoff
-        Note over R,P: loops back to step 1 until the holder releases the subdomain
+        R->>K: Phase=Degraded, reason SubdomainBusy
+        Note over R,K: Pod is left alone — not deleted
+        K->>P: kubelet restarts the container per restartPolicy Always, capped backoff
+        P->>S: TunnelRequested, subdomain muzaffar-web, again
+        Note over R,P: loops until the holder releases the subdomain
     else behavior addSuffix
         Note over R: unreachable in v1, rejected by CEL at admission
     end
@@ -657,9 +713,15 @@ sequenceDiagram
   `SubdomainBusy`, pod deleted, no retry. Only a spec change re-arms it. The
   right default: a taken subdomain usually means a typo or a real conflict with
   another tunnel, and silently retrying forever hides that.
-- **`retry`** — stays `Pending`/`Degraded` and requeues with capped exponential
-  backoff until the holder releases the subdomain. Correct for
-  intentional handover, e.g. replacing a laptop-run tunnel with a cluster one.
+- **`retry`** — stays `Phase=Degraded`, reason `SubdomainBusy`, and the
+  **Pod is left running**. Retry is entirely `kubelet`'s job: `restartPolicy:
+  Always` already retries with capped exponential backoff, and a container
+  restart *is* a fresh subdomain claim attempt. The controller must not also
+  delete-and-recreate the Pod for the same exit code — that would be two retry
+  engines racing each other. (This replaces an earlier version of this section,
+  which had the controller delete the Pod and requeue itself for `retry`.)
+  Correct for intentional handover, e.g. replacing a laptop-run tunnel with a
+  cluster one.
 - **`addSuffix`** — schema-visible, **rejected by CEL in v1** (§5.4). When
   implemented it will generate `<base>-<5 chars>`, truncating `base` to keep the
   total ≤ 38 (F9), and pin it in `status.assignedSubdomain` so the public URL is
@@ -786,6 +848,12 @@ rather than shipping a policy that appears to constrain more than it does.
 If the backend namespace has a default-deny ingress policy, it must additionally
 allow ingress from `jprq-system`.
 
+**The manager also needs egress to `jprq.io:443`**, separately from the agent's
+own startup fetch above: it lazily calls `GET /config.json` to resolve the jprq
+base domain for `status.url` (§9.2), cached for the process lifetime on
+success. Unlike the agent's fetch, a failure here is non-fatal — it only leaves
+`status.url` empty.
+
 ---
 
 ## 13. Repository layout
@@ -849,6 +917,12 @@ construction rather than by convention:
 | D-12 | CNAME in schema, rejected by CEL in v1 | ship it; omit it | Settles the API shape with no false impression it works |
 | D-13 | No tenancy guardrail in v1 | namespace opt-in label | Explicitly accepted; documented in §12.2 |
 | D-14 | Separate manager and agent images | one image, subcommand dispatch | A combined image would put the manager binary and its API-server client inside the internet-exposed pod; skew handled via shared constants + `--agent-image` — §13 |
+| D-15 | Manager composes `status.url` from a cached `GET jprq.io/config.json` + `assignedSubdomain` | parse the agent's stdout for a `tunnel_opened` line | That log line does not exist (`cli/jprqc.go` prints an unstructured `Forwarded:` line); the URL is server-assigned and cosmetic, so a failed fetch must not block Pod creation — §9.2, §12.3 |
+| D-16 | Retry for exit 10 (`collisionBehavior: retry`) is `kubelet`'s job; the controller never deletes the Pod for it | controller deletes + requeues on a timer | `restartPolicy: Always` is already a retry engine; deleting too would race it — §9.3 |
+| D-17 | `BackendReady` requires the Service to exist, its port to resolve, **and** ≥1 ready EndpointSlice endpoint | Service + port resolution only | Closes the `/healthz`-dials-backend question without changing the agent — §9.2, §17.7. Deliberately asymmetric: never *deletes* a running Pod when endpoints drop to zero, since that would release the subdomain and F12 may not let it be won back |
+| D-18 | Secrets RBAC is a cluster-wide `ClusterRole`, cache scoped to `jprq-system` | namespaced `Role` per backend namespace | Consistent with §12.2's accepted absence of a tenancy boundary; a namespaced Role would imply a boundary that doesn't exist — §17.7 |
+| D-19 | Spec-hash includes a SHA-256 digest of the token bytes, not just the Secret name and key | hash name/key only | Without it, an in-place token rotation never changes the hash, so the agent keeps running with the token it read at startup — §9.1 |
+| D-20 | Events emitted via `events.k8s.io/v1` (`recorder.EventRecorder`) for terminal failures, collisions, and Pod create/recreate | the deprecated core `record.EventRecorder`; no events | Terminal transitions are otherwise visible only in `status` and manager logs |
 
 ---
 
@@ -975,17 +1049,33 @@ are gitignored — tool binaries are never committed, since versions are pinned 
 the Makefile and `bin/controller-gen` is an absolute symlink that would dangle in
 any other checkout.
 
-### 17.7 Still pending before phase 3
+### 17.7 Phase 2/3 deltas
 
-- Operator namespace: the scaffold produced `jprq-bek-system`; §12 and §13 say
-  `jprq-system`. Needs changing in `config/default/`, `config/rbac/`,
-  `config/manager/`.
-- Second Dockerfile, or one parameterized by `ARG CMD`, for the agent image.
-- **Undecided:** should `/healthz` also TCP-dial the backend? As shipped,
-  readiness means "event stream established", so a pod with a wrong
-  `JPRQ_BACKEND_HOST` reports Ready and `status.phase: Active` while every request
-  502s. Including a backend dial would make Pod-Ready mean "works end to end" and
-  align it with what §5.5's `Active` implies. This changes §5.5 semantics, so it
-  is deliberately left open.
-- Nothing is committed yet: `cli/`, `Makefile`, `go.mod`, `go.sum`, `.gitignore`,
-  and the whole scaffold are uncommitted working-tree changes.
+- **Operator namespace fixed to `jprq-system`.** The scaffold's `namePrefix:
+  jprq-bek-` in `config/default/kustomization.yaml` was the actual source of
+  the namespace name (the Namespace object is literally named `system`), so
+  both `namespace:` and `namePrefix:` had to change together — changing only
+  `namespace:` would have created `jprq-bek-system` while placing resources in
+  a `jprq-system` that no manifest defines.
+- **Resolved:** should `/healthz` also TCP-dial the backend? No — left as
+  shipped ("event stream established"), because `BackendReady` now separately
+  requires ≥1 ready EndpointSlice endpoint (§9.2) before a Pod is even created,
+  and a running Pod is deliberately never deleted for a backend that later
+  drops to zero ready endpoints (§9.2's asymmetry, driven by F12). Pod-Ready
+  still doesn't mean "works end to end" for reasons downstream of readiness
+  (e.g. an app-level 500), but the common failure this question worried about —
+  a backend with no healthy replicas — is now caught without touching the
+  agent.
+- **Secrets RBAC stays a cluster-wide `ClusterRole`** (read), consistent with
+  §12.2's accepted absence of a tenancy boundary — a namespaced Role per
+  backend namespace would imply a boundary that doesn't otherwise exist. The
+  informer *cache* stays scoped to `jprq-system` only (`cmd/main.go`'s
+  `cache.Options`), so this is not the same as watching every Secret in the
+  cluster.
+- **Events are emitted** via the `events.k8s.io/v1` recorder
+  (`recorder.EventRecorder`, not the deprecated `record.EventRecorder`) for
+  terminal failures, collisions, and Pod create/recreate — see §14 decision
+  log.
+- Still open: a second Dockerfile, or one parameterized by `ARG CMD`, for the
+  agent image — deferred to the phase that first needs a runnable agent image
+  (kind e2e).

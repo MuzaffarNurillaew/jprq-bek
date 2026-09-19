@@ -25,10 +25,13 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -37,6 +40,7 @@ import (
 
 	tunnelv1alpha1 "github.com/muzaffarnurillaew/jprq-bek/api/v1alpha1"
 	"github.com/muzaffarnurillaew/jprq-bek/internal/controller"
+	"github.com/muzaffarnurillaew/jprq-bek/internal/jprqconfig"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -63,6 +67,10 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var agentImage string
+	var operatorNamespace string
+	var jprqConfigURL string
+	var jprqDomain string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -82,6 +90,17 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	// The agent image is a manager-level setting, never a field on the CR: a
+	// user-settable image would be a privilege-escalation path, since v1 has no
+	// tenancy boundary on what a JprqTunnel may expose (DESIGN.md §12.2).
+	flag.StringVar(&agentImage, "agent-image", "ghcr.io/muzaffarnurillaew/jprq-bek-agent:v0.1.0",
+		"Image used for agent pods.")
+	flag.StringVar(&operatorNamespace, "operator-namespace", "jprq-system",
+		"Namespace holding agent pods and jprq token Secrets.")
+	flag.StringVar(&jprqConfigURL, "jprq-config-url", jprqconfig.DefaultURL,
+		"Remote config used to resolve the jprq base domain for status.url.")
+	flag.StringVar(&jprqDomain, "jprq-domain", "",
+		"Base domain, e.g. jprq.live. Set this to skip the remote config fetch entirely.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -165,6 +184,21 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "7c354bda.jprq.io",
+		// Pods and Secrets are only ever read from the operator namespace, so
+		// don't cache them cluster-wide — that would mean holding every Secret
+		// in the cluster in memory. Services and EndpointSlices stay
+		// cluster-wide because backends are cross-namespace by design.
+		//
+		// Note: restricting a kind this way removes its global fallback cache,
+		// so a Get outside these namespaces returns a plain error rather than a
+		// NotFound. Every Pod/Secret Get in the reconciler is keyed with
+		// OperatorNamespace for exactly that reason.
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Pod{}:    {Namespaces: map[string]cache.Config{operatorNamespace: {}}},
+				&corev1.Secret{}: {Namespaces: map[string]cache.Config{operatorNamespace: {}}},
+			},
+		},
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -183,8 +217,12 @@ func main() {
 	}
 
 	if err := (&controller.JprqTunnelReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Recorder:          mgr.GetEventRecorder("jprqtunnel"),
+		AgentImage:        agentImage,
+		OperatorNamespace: operatorNamespace,
+		Domain:            jprqconfig.NewResolver(jprqConfigURL, jprqDomain),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "jprqtunnel")
 		os.Exit(1)
