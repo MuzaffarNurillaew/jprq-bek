@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Tool binaries downloaded by the Makefile (versions pinned there)
+bin/
+testbin/
+Dockerfile.cross

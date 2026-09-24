@@ -1,0 +1,23 @@
+# Build the agent (jprq CLI) binary.
+# Override BASE_IMAGE to build from another registry, e.g. docker.io/library/golang:1.26
+ARG BASE_IMAGE=golang:1.26
+FROM ${BASE_IMAGE} AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o agent ./cli
+
+# Use distroless as minimal base image to package the agent binary.
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /workspace/agent .
+USER 65532:65532
+
+ENTRYPOINT ["/agent"]

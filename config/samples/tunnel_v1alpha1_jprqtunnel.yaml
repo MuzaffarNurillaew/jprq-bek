@@ -1,0 +1,17 @@
+apiVersion: tunnel.jprq.io/v1alpha1
+kind: JprqTunnel
+metadata:
+  labels:
+    app.kubernetes.io/name: jprq-bek
+    app.kubernetes.io/managed-by: kustomize
+  name: web
+spec:
+  subdomain: muzaffar-web
+  subdomainCollisionBehavior: fail
+  backend:
+    namespace: default
+    serviceName: web
+    port: http
+  jprqTokenSecret:
+    name: jprq-token
+    key: authToken
